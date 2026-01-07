@@ -7,13 +7,21 @@ from flask import Flask, request, send_file, after_this_request
 
 app = Flask(__name__)
 
-# --- CAMBIO 1: Usamos un servidor espejo más rápido (Kumi Systems) ---
-# Si este fallara algún día, puedes probar: "https://lz4.overpass-api.de/api/interpreter"
+# Usamos el mirror rápido
 OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
+
+# --- DICCIONARIO DE ABREVIATURAS ---
+# Esto ayuda a que "W" encuentre "West", "Av" encuentre "Avenue", etc.
+ABBREVIATIONS = {
+    "West": "W", "North": "N", "South": "S", "East": "E",
+    "Avenue": "Ave Av", "Street": "St", "Boulevard": "Blvd",
+    "Road": "Rd", "Drive": "Dr", "Lane": "Ln", "Court": "Ct",
+    "Place": "Pl", "Square": "Sq", "Highway": "Hwy"
+}
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Mirror Kumi) is Running", 200
+    return "Car Launcher API (Smart Search) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -28,7 +36,6 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # Solicitamos XML
         query = f"""
         [out:xml][timeout:180];
         (
@@ -38,45 +45,36 @@ def generate_db():
         out center;
         """
         
-        print(f"Descargando desde Mirror Kumi: {min_lat},{min_lon}")
+        print(f"Descargando (Smart Mode): {min_lat},{min_lon}")
         
-        # --- CAMBIO 2: Agregamos Headers para que no nos bloqueen por ser "bot" ---
         headers = {
-            'User-Agent': 'CarLauncher/1.0 (Project for offline maps)',
+            'User-Agent': 'CarLauncher/1.0',
             'Accept-Encoding': 'gzip'
         }
         
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
         
-        # Verificar si el servidor espejo nos rechazó
         if response.status_code != 200:
-            # Leemos un poco del error para el log
-            try:
-                error_msg = f"OSM Error {response.status_code}: {response.text[:200]}"
-            except:
-                error_msg = f"OSM Error {response.status_code}"
-            print(error_msg)
-            return error_msg, 502
+            return f"OSM Error {response.status_code}", 502
 
-        # Descompresión automática
         response.raw.decode_content = True
 
-        # Preparamos la DB
         conn = sqlite3.connect(filename)
         cursor = conn.cursor()
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
+        # --- CAMBIO IMPORTANTE: Agregamos columna 'keywords' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
                 name, 
                 address, 
                 lat, 
-                lon
+                lon,
+                keywords  -- Columna oculta para búsquedas inteligentes
             );
         ''')
 
-        # Procesamiento por Streaming
         context = ET.iterparse(response.raw, events=('end',))
         
         batch = []
@@ -101,6 +99,15 @@ def generate_db():
                     elif 'highway' in tags:
                         addr = "Calle"
                         
+                    # --- LÓGICA DE ALIAS ---
+                    # Generamos una versión del nombre con abreviaturas
+                    # Ej: "West Washington" -> "West Washington W Washington"
+                    keywords = name
+                    for full, abbr in ABBREVIATIONS.items():
+                        if full in name:
+                            # Agregamos la versión abreviada a las palabras clave
+                            keywords += " " + name.replace(full, abbr)
+                    
                     lat = None
                     lon = None
                     
@@ -114,21 +121,22 @@ def generate_db():
                             lon = center.get('lon')
 
                     if lat and lon:
-                        batch.append((name, addr, lat, lon))
+                        # Guardamos: name, addr, lat, lon, KEYWORDS
+                        batch.append((name, addr, lat, lon, keywords))
                         count += 1
 
                 elem.clear()
                 
                 if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO search_index (name, address, lat, lon) VALUES (?, ?, ?, ?)", batch)
+                    cursor.executemany("INSERT INTO search_index (name, address, lat, lon, keywords) VALUES (?, ?, ?, ?, ?)", batch)
                     batch = []
 
         if batch:
-            cursor.executemany("INSERT INTO search_index (name, address, lat, lon) VALUES (?, ?, ?, ?)", batch)
+            cursor.executemany("INSERT INTO search_index (name, address, lat, lon, keywords) VALUES (?, ?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
-        print(f"¡ÉXITO! Procesados {count} elementos.")
+        print(f"¡ÉXITO! {count} items indexados.")
 
         @after_this_request
         def remove_file(response):
@@ -144,7 +152,7 @@ def generate_db():
     except Exception as e:
         if conn: conn.close()
         if os.path.exists(filename): os.remove(filename)
-        print(f"Error crítico en Python: {e}")
+        print(f"Error crítico: {e}")
         return f"Error interno: {str(e)}", 500
 
 if __name__ == '__main__':
