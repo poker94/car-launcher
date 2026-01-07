@@ -7,11 +7,10 @@ from flask import Flask, request, send_file, after_this_request
 
 app = Flask(__name__)
 
-# Usamos el mirror rápido
+# Mirror rápido
 OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 
-# --- DICCIONARIO DE ABREVIATURAS ---
-# Esto ayuda a que "W" encuentre "West", "Av" encuentre "Avenue", etc.
+# 1. DICCIONARIO DE ABREVIATURAS (Para búsqueda inteligente)
 ABBREVIATIONS = {
     "West": "W", "North": "N", "South": "S", "East": "E",
     "Avenue": "Ave Av", "Street": "St", "Boulevard": "Blvd",
@@ -19,9 +18,19 @@ ABBREVIATIONS = {
     "Place": "Pl", "Square": "Sq", "Highway": "Hwy"
 }
 
+# 2. DICCIONARIO DE IDIOMAS (Para etiquetas visuales)
+# Puedes agregar más idiomas aquí (pt, fr, it, etc.)
+LANG_LABELS = {
+    'es': { 'highway': 'Calle', 'amenity': 'Lugar' },
+    'en': { 'highway': 'Street', 'amenity': 'Place' },
+    'pt': { 'highway': 'Rua', 'amenity': 'Lugar' },
+    'fr': { 'highway': 'Rue', 'amenity': 'Lieu' },
+    'default': { 'highway': 'Street', 'amenity': 'Place' }
+}
+
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Smart Search) is Running", 200
+    return "Car Launcher API (Multi-Lang) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -32,6 +41,12 @@ def generate_db():
         min_lon = request.args.get('minLon')
         max_lat = request.args.get('maxLat')
         max_lon = request.args.get('maxLon')
+        
+        # Leemos el idioma (por defecto inglés si no llega nada)
+        lang_code = request.args.get('lang', 'en')
+        
+        # Seleccionamos las etiquetas según el idioma
+        labels = LANG_LABELS.get(lang_code, LANG_LABELS['default'])
         
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
@@ -45,7 +60,7 @@ def generate_db():
         out center;
         """
         
-        print(f"Descargando (Smart Mode): {min_lat},{min_lon}")
+        print(f"Descargando: {min_lat},{min_lon} Idioma: {lang_code}")
         
         headers = {
             'User-Agent': 'CarLauncher/1.0',
@@ -64,14 +79,13 @@ def generate_db():
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
-        # --- CAMBIO IMPORTANTE: Agregamos columna 'keywords' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
                 name, 
                 address, 
                 lat, 
                 lon,
-                keywords  -- Columna oculta para búsquedas inteligentes
+                keywords
             );
         ''')
 
@@ -93,19 +107,20 @@ def generate_db():
                 if name:
                     addr = ""
                     if 'addr:street' in tags:
+                        # Si OSM ya trae calle y número, usamos eso
                         addr = f"{tags['addr:street']} {tags.get('addr:housenumber', '')}"
                     elif 'amenity' in tags:
-                        addr = tags['amenity']
+                        # Usamos la etiqueta traducida o el tipo de amenity
+                        addr = labels['amenity'] 
+                        # Opcional: si quieres el tipo específico (ej: School) descomenta esto:
+                        # addr = tags['amenity'].capitalize()
                     elif 'highway' in tags:
-                        addr = "Calle"
+                        # AQUÍ LA MAGIA: Usamos la traducción según el idioma
+                        addr = labels['highway']
                         
-                    # --- LÓGICA DE ALIAS ---
-                    # Generamos una versión del nombre con abreviaturas
-                    # Ej: "West Washington" -> "West Washington W Washington"
                     keywords = name
                     for full, abbr in ABBREVIATIONS.items():
                         if full in name:
-                            # Agregamos la versión abreviada a las palabras clave
                             keywords += " " + name.replace(full, abbr)
                     
                     lat = None
@@ -121,7 +136,6 @@ def generate_db():
                             lon = center.get('lon')
 
                     if lat and lon:
-                        # Guardamos: name, addr, lat, lon, KEYWORDS
                         batch.append((name, addr, lat, lon, keywords))
                         count += 1
 
@@ -136,7 +150,6 @@ def generate_db():
 
         conn.commit()
         conn.close()
-        print(f"¡ÉXITO! {count} items indexados.")
 
         @after_this_request
         def remove_file(response):
@@ -152,7 +165,6 @@ def generate_db():
     except Exception as e:
         if conn: conn.close()
         if os.path.exists(filename): os.remove(filename)
-        print(f"Error crítico: {e}")
         return f"Error interno: {str(e)}", 500
 
 if __name__ == '__main__':
