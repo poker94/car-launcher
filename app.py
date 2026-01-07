@@ -12,7 +12,7 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Stream Optimized) is Running", 200
+    return "Car Launcher API (Gzip Fix) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -27,8 +27,7 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # 1. Solicitamos XML en lugar de JSON (out:xml)
-        # Usamos stream=True para no cargar todo en memoria
+        # Solicitamos XML
         query = f"""
         [out:xml][timeout:180];
         (
@@ -38,17 +37,26 @@ def generate_db():
         out center;
         """
         
-        print(f"Iniciando descarga Stream OSM...")
-        # stream=True es la clave aquí
+        print(f"Iniciando descarga Stream OSM para: {min_lat},{min_lon}")
+        
+        # stream=True es vital
         response = requests.get(OVERPASS_URL, params={'data': query}, stream=True)
         
+        # --- CORRECCIÓN CRÍTICA ---
+        # 1. Verificar si OSM nos rechazó la conexión antes de intentar leer
         if response.status_code != 200:
-            return f"Error OSM: {response.status_code}", 502
+            error_msg = f"OSM Error {response.status_code}: {response.text[:200]}" # Leemos solo el principio
+            print(error_msg)
+            return error_msg, 502
 
-        # 2. Preparamos la DB
+        # 2. ACTIVAR DESCOMPRESIÓN AUTOMÁTICA
+        # Esto evita que el XML parser reciba basura binaria (Gzip) y explote
+        response.raw.decode_content = True
+
+        # Preparamos la DB
         conn = sqlite3.connect(filename)
         cursor = conn.cursor()
-        cursor.execute('PRAGMA synchronous = OFF') # Acelera la escritura
+        cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
         cursor.execute('''
@@ -60,8 +68,8 @@ def generate_db():
             );
         ''')
 
-        # 3. Procesamiento por Streaming (Iterparse)
-        # Esto lee el archivo XML a medida que se descarga
+        # Procesamiento por Streaming
+        # Ahora sí, response.raw entrega texto limpio, no zip
         context = ET.iterparse(response.raw, events=('end',))
         
         batch = []
@@ -70,7 +78,6 @@ def generate_db():
         for event, elem in context:
             if elem.tag in ('node', 'way'):
                 tags = {}
-                # Extraer tags hijos
                 for tag in elem.findall('tag'):
                     k = tag.get('k')
                     v = tag.get('v')
@@ -79,7 +86,6 @@ def generate_db():
                 name = tags.get('name')
                 
                 if name:
-                    # Lógica de dirección
                     addr = ""
                     if 'addr:street' in tags:
                         addr = f"{tags['addr:street']} {tags.get('addr:housenumber', '')}"
@@ -88,7 +94,6 @@ def generate_db():
                     elif 'highway' in tags:
                         addr = "Calle"
                         
-                    # Lógica de coordenadas
                     lat = None
                     lon = None
                     
@@ -96,7 +101,6 @@ def generate_db():
                         lat = elem.get('lat')
                         lon = elem.get('lon')
                     elif elem.tag == 'way':
-                        # En 'out center', los ways tienen un hijo <center>
                         center = elem.find('center')
                         if center is not None:
                             lat = center.get('lat')
@@ -106,21 +110,18 @@ def generate_db():
                         batch.append((name, addr, lat, lon))
                         count += 1
 
-                # 4. Limpieza de memoria fundamental
                 elem.clear()
                 
-                # Insertar en lotes de 1000 para no saturar RAM
                 if len(batch) >= 1000:
                     cursor.executemany("INSERT INTO search_index (name, address, lat, lon) VALUES (?, ?, ?, ?)", batch)
                     batch = []
 
-        # Insertar los restantes
         if batch:
             cursor.executemany("INSERT INTO search_index (name, address, lat, lon) VALUES (?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
-        print(f"Procesados {count} elementos con éxito.")
+        print(f"¡ÉXITO! Procesados {count} elementos.")
 
         @after_this_request
         def remove_file(response):
@@ -136,7 +137,7 @@ def generate_db():
     except Exception as e:
         if conn: conn.close()
         if os.path.exists(filename): os.remove(filename)
-        print(f"Error crítico: {e}")
+        print(f"Error crítico en Python: {e}")
         return f"Error interno: {str(e)}", 500
 
 if __name__ == '__main__':
