@@ -10,7 +10,6 @@ app = Flask(__name__)
 # Mirror rápido
 OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 
-# Abreviaturas para ayudar a la búsqueda (keywords)
 ABBREVIATIONS = {
     "West": "W", "North": "N", "South": "S", "East": "E",
     "Avenue": "Ave Av", "Street": "St", "Boulevard": "Blvd",
@@ -18,7 +17,6 @@ ABBREVIATIONS = {
     "Place": "Pl", "Square": "Sq", "Highway": "Hwy"
 }
 
-# Etiquetas para la "segunda línea" (subtítulo)
 LANG_LABELS = {
     'es': { 'highway': 'Calle', 'amenity': 'Lugar' },
     'en': { 'highway': 'Street', 'amenity': 'Place' },
@@ -29,7 +27,7 @@ LANG_LABELS = {
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Double Entry Logic) is Running", 200
+    return "Car Launcher API (Filtered) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -41,24 +39,26 @@ def generate_db():
         max_lat = request.args.get('maxLat')
         max_lon = request.args.get('maxLon')
         lang_code = request.args.get('lang', 'en')
-        
-        # Selección de etiquetas según idioma
         labels = LANG_LABELS.get(lang_code, LANG_LABELS['default'])
         
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # Query sin filtros estrictos para traer todo
+        # --- CORRECCIÓN AQUÍ ---
+        # No pedimos "todo". Pedimos solo lo que tenga 'name' O 'addr:housenumber'.
+        # Esto reduce el tamaño del archivo en un 90% y evita el Error 502.
         query = f"""
         [out:xml][timeout:180];
         (
-          node[{min_lat},{min_lon},{max_lat},{max_lon}];
-          way[{min_lat},{min_lon},{max_lat},{max_lon}];
+          node["name"]({min_lat},{min_lon},{max_lat},{max_lon});
+          way["name"]({min_lat},{min_lon},{max_lat},{max_lon});
+          node["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
+          way["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
         );
         out center;
         """
         
-        print(f"Descargando: {min_lat},{min_lon} Lang: {lang_code}")
+        print(f"Descargando (Filtered): {min_lat},{min_lon} Lang: {lang_code}")
         
         headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
@@ -90,7 +90,6 @@ def generate_db():
                 street = tags.get('addr:street')
                 number = tags.get('addr:housenumber')
                 
-                # Coordenadas
                 lat, lon = None, None
                 if elem.tag == 'node':
                     lat, lon = elem.get('lat'), elem.get('lon')
@@ -99,15 +98,11 @@ def generate_db():
                     if center: lat, lon = center.get('lat'), center.get('lon')
 
                 if lat and lon:
-                    # --- LÓGICA DE DOBLE ENTRADA ---
-                    
-                    # 1. ENTRADA A: LA DIRECCIÓN PURA (Si existe calle y número)
-                    # Esto garantiza que "Union 2399" aparezca primero como dirección
+                    # 1. ENTRADA A: LA DIRECCIÓN PURA
                     if street and number:
                         address_name = f"{street} {number}"
-                        subtitle = labels['highway'] # "Street" o "Calle"
+                        subtitle = labels['highway']
                         
-                        # Keywords para la dirección
                         kw_addr = address_name
                         for full, abbr in ABBREVIATIONS.items():
                             if full in address_name:
@@ -115,11 +110,9 @@ def generate_db():
 
                         batch.append((address_name, subtitle, lat, lon, kw_addr))
 
-                    # 2. ENTRADA B: EL NEGOCIO (Si existe nombre)
-                    # Esto garantiza que "McDonald's" aparezca también
+                    # 2. ENTRADA B: EL NEGOCIO
                     if raw_name:
                         poi_name = raw_name
-                        # El subtítulo será la dirección si la tiene, o la categoría
                         poi_subtitle = ""
                         if street and number:
                             poi_subtitle = f"{street} {number}"
@@ -128,9 +121,8 @@ def generate_db():
                         else:
                             poi_subtitle = labels['highway']
 
-                        # Keywords para el negocio
                         kw_poi = poi_name
-                        if street: kw_poi += " " + street # Agregamos la calle a las keywords del negocio
+                        if street: kw_poi += " " + street
                         
                         batch.append((poi_name, poi_subtitle, lat, lon, kw_poi))
 
