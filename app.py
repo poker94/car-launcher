@@ -7,12 +7,13 @@ from flask import Flask, request, send_file, after_this_request
 
 app = Flask(__name__)
 
-# Configuración
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# --- CAMBIO 1: Usamos un servidor espejo más rápido (Kumi Systems) ---
+# Si este fallara algún día, puedes probar: "https://lz4.overpass-api.de/api/interpreter"
+OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Gzip Fix) is Running", 200
+    return "Car Launcher API (Mirror Kumi) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -37,20 +38,27 @@ def generate_db():
         out center;
         """
         
-        print(f"Iniciando descarga Stream OSM para: {min_lat},{min_lon}")
+        print(f"Descargando desde Mirror Kumi: {min_lat},{min_lon}")
         
-        # stream=True es vital
-        response = requests.get(OVERPASS_URL, params={'data': query}, stream=True)
+        # --- CAMBIO 2: Agregamos Headers para que no nos bloqueen por ser "bot" ---
+        headers = {
+            'User-Agent': 'CarLauncher/1.0 (Project for offline maps)',
+            'Accept-Encoding': 'gzip'
+        }
         
-        # --- CORRECCIÓN CRÍTICA ---
-        # 1. Verificar si OSM nos rechazó la conexión antes de intentar leer
+        response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
+        
+        # Verificar si el servidor espejo nos rechazó
         if response.status_code != 200:
-            error_msg = f"OSM Error {response.status_code}: {response.text[:200]}" # Leemos solo el principio
+            # Leemos un poco del error para el log
+            try:
+                error_msg = f"OSM Error {response.status_code}: {response.text[:200]}"
+            except:
+                error_msg = f"OSM Error {response.status_code}"
             print(error_msg)
             return error_msg, 502
 
-        # 2. ACTIVAR DESCOMPRESIÓN AUTOMÁTICA
-        # Esto evita que el XML parser reciba basura binaria (Gzip) y explote
+        # Descompresión automática
         response.raw.decode_content = True
 
         # Preparamos la DB
@@ -69,7 +77,6 @@ def generate_db():
         ''')
 
         # Procesamiento por Streaming
-        # Ahora sí, response.raw entrega texto limpio, no zip
         context = ET.iterparse(response.raw, events=('end',))
         
         batch = []
