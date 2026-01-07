@@ -10,7 +10,7 @@ app = Flask(__name__)
 # Mirror rápido
 OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 
-# 1. DICCIONARIO DE ABREVIATURAS (Para búsqueda inteligente)
+# Abreviaturas para ayudar a la búsqueda (keywords)
 ABBREVIATIONS = {
     "West": "W", "North": "N", "South": "S", "East": "E",
     "Avenue": "Ave Av", "Street": "St", "Boulevard": "Blvd",
@@ -18,8 +18,7 @@ ABBREVIATIONS = {
     "Place": "Pl", "Square": "Sq", "Highway": "Hwy"
 }
 
-# 2. DICCIONARIO DE IDIOMAS (Para etiquetas visuales)
-# Puedes agregar más idiomas aquí (pt, fr, it, etc.)
+# Etiquetas para la "segunda línea" (subtítulo)
 LANG_LABELS = {
     'es': { 'highway': 'Calle', 'amenity': 'Lugar' },
     'en': { 'highway': 'Street', 'amenity': 'Place' },
@@ -30,7 +29,7 @@ LANG_LABELS = {
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Multi-Lang) is Running", 200
+    return "Car Launcher API (Double Entry Logic) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -41,32 +40,27 @@ def generate_db():
         min_lon = request.args.get('minLon')
         max_lat = request.args.get('maxLat')
         max_lon = request.args.get('maxLon')
-        
-        # Leemos el idioma (por defecto inglés si no llega nada)
         lang_code = request.args.get('lang', 'en')
         
-        # Seleccionamos las etiquetas según el idioma
+        # Selección de etiquetas según idioma
         labels = LANG_LABELS.get(lang_code, LANG_LABELS['default'])
         
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
+        # Query sin filtros estrictos para traer todo
         query = f"""
         [out:xml][timeout:180];
         (
-          node["name"]({min_lat},{min_lon},{max_lat},{max_lon});
-          way["name"]({min_lat},{min_lon},{max_lat},{max_lon});
+          node[{min_lat},{min_lon},{max_lat},{max_lon}];
+          way[{min_lat},{min_lon},{max_lat},{max_lon}];
         );
         out center;
         """
         
-        print(f"Descargando: {min_lat},{min_lon} Idioma: {lang_code}")
+        print(f"Descargando: {min_lat},{min_lon} Lang: {lang_code}")
         
-        headers = {
-            'User-Agent': 'CarLauncher/1.0',
-            'Accept-Encoding': 'gzip'
-        }
-        
+        headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
         
         if response.status_code != 200:
@@ -81,72 +75,72 @@ def generate_db():
         
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
-                name, 
-                address, 
-                lat, 
-                lon,
-                keywords
+                name, address, lat, lon, keywords
             );
         ''')
 
         context = ET.iterparse(response.raw, events=('end',))
-        
         batch = []
-        count = 0
         
         for event, elem in context:
             if elem.tag in ('node', 'way'):
-                tags = {}
-                for tag in elem.findall('tag'):
-                    k = tag.get('k')
-                    v = tag.get('v')
-                    tags[k] = v
+                tags = {tag.get('k'): tag.get('v') for tag in elem.findall('tag')}
                 
-                name = tags.get('name')
+                raw_name = tags.get('name')
+                street = tags.get('addr:street')
+                number = tags.get('addr:housenumber')
                 
-                if name:
-                    addr = ""
-                    if 'addr:street' in tags:
-                        # Si OSM ya trae calle y número, usamos eso
-                        addr = f"{tags['addr:street']} {tags.get('addr:housenumber', '')}"
-                    elif 'amenity' in tags:
-                        # Usamos la etiqueta traducida o el tipo de amenity
-                        addr = labels['amenity'] 
-                        # Opcional: si quieres el tipo específico (ej: School) descomenta esto:
-                        # addr = tags['amenity'].capitalize()
-                    elif 'highway' in tags:
-                        # AQUÍ LA MAGIA: Usamos la traducción según el idioma
-                        addr = labels['highway']
-                        
-                    keywords = name
-                    for full, abbr in ABBREVIATIONS.items():
-                        if full in name:
-                            keywords += " " + name.replace(full, abbr)
-                    
-                    lat = None
-                    lon = None
-                    
-                    if elem.tag == 'node':
-                        lat = elem.get('lat')
-                        lon = elem.get('lon')
-                    elif elem.tag == 'way':
-                        center = elem.find('center')
-                        if center is not None:
-                            lat = center.get('lat')
-                            lon = center.get('lon')
+                # Coordenadas
+                lat, lon = None, None
+                if elem.tag == 'node':
+                    lat, lon = elem.get('lat'), elem.get('lon')
+                elif elem.tag == 'way':
+                    center = elem.find('center')
+                    if center: lat, lon = center.get('lat'), center.get('lon')
 
-                    if lat and lon:
-                        batch.append((name, addr, lat, lon, keywords))
-                        count += 1
+                if lat and lon:
+                    # --- LÓGICA DE DOBLE ENTRADA ---
+                    
+                    # 1. ENTRADA A: LA DIRECCIÓN PURA (Si existe calle y número)
+                    # Esto garantiza que "Union 2399" aparezca primero como dirección
+                    if street and number:
+                        address_name = f"{street} {number}"
+                        subtitle = labels['highway'] # "Street" o "Calle"
+                        
+                        # Keywords para la dirección
+                        kw_addr = address_name
+                        for full, abbr in ABBREVIATIONS.items():
+                            if full in address_name:
+                                kw_addr += " " + address_name.replace(full, abbr)
+
+                        batch.append((address_name, subtitle, lat, lon, kw_addr))
+
+                    # 2. ENTRADA B: EL NEGOCIO (Si existe nombre)
+                    # Esto garantiza que "McDonald's" aparezca también
+                    if raw_name:
+                        poi_name = raw_name
+                        # El subtítulo será la dirección si la tiene, o la categoría
+                        poi_subtitle = ""
+                        if street and number:
+                            poi_subtitle = f"{street} {number}"
+                        elif 'amenity' in tags:
+                            poi_subtitle = labels['amenity']
+                        else:
+                            poi_subtitle = labels['highway']
+
+                        # Keywords para el negocio
+                        kw_poi = poi_name
+                        if street: kw_poi += " " + street # Agregamos la calle a las keywords del negocio
+                        
+                        batch.append((poi_name, poi_subtitle, lat, lon, kw_poi))
 
                 elem.clear()
-                
-                if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO search_index (name, address, lat, lon, keywords) VALUES (?, ?, ?, ?, ?)", batch)
+                if len(batch) >= 2000:
+                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?)", batch)
                     batch = []
 
         if batch:
-            cursor.executemany("INSERT INTO search_index (name, address, lat, lon, keywords) VALUES (?, ?, ?, ?, ?)", batch)
+            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
@@ -154,18 +148,15 @@ def generate_db():
         @after_this_request
         def remove_file(response):
             try:
-                if os.path.exists(filename):
-                    os.remove(filename)
-            except Exception as error:
-                app.logger.error("Error removing file", error)
+                if os.path.exists(filename): os.remove(filename)
+            except: pass
             return response
 
         return send_file(filename, as_attachment=True, download_name="offline_data.db")
 
     except Exception as e:
         if conn: conn.close()
-        if os.path.exists(filename): os.remove(filename)
-        return f"Error interno: {str(e)}", 500
+        return f"Error: {e}", 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
