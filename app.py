@@ -27,7 +27,7 @@ LANG_LABELS = {
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Filtered) is Running", 200
+    return "Car Launcher API (Multi-Map Merge) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -44,9 +44,7 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # --- CORRECCIÓN AQUÍ ---
-        # No pedimos "todo". Pedimos solo lo que tenga 'name' O 'addr:housenumber'.
-        # Esto reduce el tamaño del archivo en un 90% y evita el Error 502.
+        # Query optimizada (solo nombres o direcciones)
         query = f"""
         [out:xml][timeout:180];
         (
@@ -58,7 +56,7 @@ def generate_db():
         out center;
         """
         
-        print(f"Descargando (Filtered): {min_lat},{min_lon} Lang: {lang_code}")
+        print(f"Descargando Merge-Ready: {min_lat},{min_lon}")
         
         headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
@@ -73,9 +71,15 @@ def generate_db():
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
+        # --- CAMBIO IMPORTANTE: Columna 'osm_id' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
-                name, address, lat, lon, keywords
+                osm_id,  -- ID Único para evitar duplicados al fusionar
+                name, 
+                address, 
+                lat, 
+                lon, 
+                keywords
             );
         ''')
 
@@ -84,6 +88,11 @@ def generate_db():
         
         for event, elem in context:
             if elem.tag in ('node', 'way'):
+                # Generamos ID único: "n12345" o "w67890"
+                raw_id = elem.get('id')
+                type_prefix = "n" if elem.tag == 'node' else "w"
+                unique_osm_id = f"{type_prefix}{raw_id}"
+
                 tags = {tag.get('k'): tag.get('v') for tag in elem.findall('tag')}
                 
                 raw_name = tags.get('name')
@@ -98,19 +107,19 @@ def generate_db():
                     if center: lat, lon = center.get('lat'), center.get('lon')
 
                 if lat and lon:
-                    # 1. ENTRADA A: LA DIRECCIÓN PURA
+                    # 1. Dirección
                     if street and number:
                         address_name = f"{street} {number}"
                         subtitle = labels['highway']
-                        
                         kw_addr = address_name
                         for full, abbr in ABBREVIATIONS.items():
                             if full in address_name:
                                 kw_addr += " " + address_name.replace(full, abbr)
 
-                        batch.append((address_name, subtitle, lat, lon, kw_addr))
+                        # Guardamos con unique_osm_id + sufijo "_addr" para diferenciarlo del negocio
+                        batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr))
 
-                    # 2. ENTRADA B: EL NEGOCIO
+                    # 2. Negocio
                     if raw_name:
                         poi_name = raw_name
                         poi_subtitle = ""
@@ -124,15 +133,15 @@ def generate_db():
                         kw_poi = poi_name
                         if street: kw_poi += " " + street
                         
-                        batch.append((poi_name, poi_subtitle, lat, lon, kw_poi))
+                        batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi))
 
                 elem.clear()
                 if len(batch) >= 2000:
-                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?)", batch)
+                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?)", batch)
                     batch = []
 
         if batch:
-            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?)", batch)
+            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
