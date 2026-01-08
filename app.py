@@ -2,6 +2,7 @@ import os
 import sqlite3
 import requests
 import uuid
+import re
 import xml.etree.ElementTree as ET
 from flask import Flask, request, send_file, after_this_request
 
@@ -25,7 +26,7 @@ LANG_LABELS = {
     'default': { 'highway': 'Street', 'amenity': 'Place' }
 }
 
-# --- NUEVO: Clasificador de Tipos para Iconos ---
+# Clasificador de Tipos para Iconos
 def get_place_type(tags):
     amenity = tags.get('amenity', '')
     shop = tags.get('shop', '')
@@ -40,18 +41,28 @@ def get_place_type(tags):
     if amenity in ['hospital', 'clinic', 'pharmacy', 'doctors']: return 'health'
     if amenity in ['cinema', 'theatre', 'casino']: return 'entertainment'
     if shop in ['supermarket', 'convenience', 'greengrocer']: return 'market'
-    if shop: return 'shop' # Cualquier otra tienda
+    if shop: return 'shop'
     if leisure in ['park', 'garden', 'pitch']: return 'park'
     if highway: return 'street'
     
-    # Si tiene número de casa pero no es nada de lo anterior
     if tags.get('addr:housenumber'): return 'home'
     
     return 'other'
 
+# --- NUEVO: Función para limpiar velocidad ---
+def parse_speed_limit(tags):
+    raw_speed = tags.get('maxspeed', '')
+    if not raw_speed: return None
+    
+    # Extraemos solo el número (ej: "50 mph" -> "50")
+    match = re.match(r"([0-9]+)", raw_speed)
+    if match:
+        return match.group(1)
+    return None
+
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Icons + Vacuum Ready) is Running", 200
+    return "Car Launcher API (Speed Limits Ready) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -68,6 +79,7 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
+        # Query actualizada: Pedimos también way["maxspeed"]
         query = f"""
         [out:xml][timeout:180];
         (
@@ -75,11 +87,12 @@ def generate_db():
           way["name"]({min_lat},{min_lon},{max_lat},{max_lon});
           node["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
           way["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
+          way["maxspeed"]({min_lat},{min_lon},{max_lat},{max_lon});
         );
         out center;
         """
         
-        print(f"Descargando Type-Ready: {min_lat},{min_lon}")
+        print(f"Descargando Speed-Ready: {min_lat},{min_lon}")
         
         headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
@@ -94,7 +107,7 @@ def generate_db():
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
-        # --- CAMBIO: Agregamos columna 'type' ---
+        # --- CAMBIO: Agregamos columna 'speed_limit' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
                 osm_id, 
@@ -103,7 +116,8 @@ def generate_db():
                 lat, 
                 lon, 
                 keywords,
-                type  -- Columna nueva para el icono
+                type,
+                speed_limit
             );
         ''')
 
@@ -122,8 +136,8 @@ def generate_db():
                 street = tags.get('addr:street')
                 number = tags.get('addr:housenumber')
                 
-                # Determinamos el tipo
                 place_type = get_place_type(tags)
+                speed = parse_speed_limit(tags) # Obtenemos la velocidad
                 
                 lat, lon = None, None
                 if elem.tag == 'node':
@@ -133,42 +147,49 @@ def generate_db():
                     if center: lat, lon = center.get('lat'), center.get('lon')
 
                 if lat and lon:
-                    # 1. Dirección
-                    if street and number:
-                        address_name = f"{street} {number}"
-                        subtitle = labels['highway']
-                        kw_addr = address_name
-                        for full, abbr in ABBREVIATIONS.items():
-                            if full in address_name:
-                                kw_addr += " " + address_name.replace(full, abbr)
-
-                        # Las direcciones puras son tipo 'home' o 'street'
-                        addr_type = 'home'
-                        batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr, addr_type))
-
-                    # 2. Negocio
-                    if raw_name:
-                        poi_name = raw_name
-                        poi_subtitle = ""
-                        if street and number:
-                            poi_subtitle = f"{street} {number}"
-                        elif 'amenity' in tags:
-                            poi_subtitle = labels['amenity']
-                        else:
-                            poi_subtitle = labels['highway']
-
-                        kw_poi = poi_name
-                        if street: kw_poi += " " + street
+                    # Guardamos si tiene nombre, dirección O velocidad
+                    if raw_name or (street and number) or speed:
                         
-                        batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi, place_type))
+                        # Lógica para Direcciones
+                        if street and number:
+                            address_name = f"{street} {number}"
+                            subtitle = labels['highway']
+                            kw_addr = address_name
+                            for full, abbr in ABBREVIATIONS.items():
+                                if full in address_name:
+                                    kw_addr += " " + address_name.replace(full, abbr)
+
+                            addr_type = 'home'
+                            # Nota: Las casas generalmente no tienen límite de velocidad propio, lo heredan de la calle
+                            batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr, addr_type, None))
+
+                        # Lógica para Negocios o Calles (con velocidad)
+                        # Si no tiene nombre pero tiene velocidad, le ponemos un nombre genérico
+                        poi_name = raw_name
+                        if not poi_name and speed:
+                            poi_name = street if street else labels['highway'] # Ej: "Street" o nombre de la calle
+
+                        if poi_name:
+                            poi_subtitle = ""
+                            if street and number:
+                                poi_subtitle = f"{street} {number}"
+                            elif 'amenity' in tags:
+                                poi_subtitle = labels['amenity']
+                            else:
+                                poi_subtitle = labels['highway']
+
+                            kw_poi = poi_name
+                            if street: kw_poi += " " + street
+                            
+                            batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi, place_type, speed))
 
                 elem.clear()
                 if len(batch) >= 2000:
-                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
                     batch = []
 
         if batch:
-            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
