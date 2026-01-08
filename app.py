@@ -25,9 +25,33 @@ LANG_LABELS = {
     'default': { 'highway': 'Street', 'amenity': 'Place' }
 }
 
+# --- NUEVO: Clasificador de Tipos para Iconos ---
+def get_place_type(tags):
+    amenity = tags.get('amenity', '')
+    shop = tags.get('shop', '')
+    leisure = tags.get('leisure', '')
+    highway = tags.get('highway', '')
+    
+    if amenity in ['fuel', 'charging_station']: return 'fuel'
+    if amenity in ['restaurant', 'fast_food', 'cafe', 'bar', 'pub']: return 'food'
+    if amenity in ['bank', 'atm']: return 'bank'
+    if amenity in ['parking']: return 'parking'
+    if amenity in ['school', 'university', 'kindergarten']: return 'school'
+    if amenity in ['hospital', 'clinic', 'pharmacy', 'doctors']: return 'health'
+    if amenity in ['cinema', 'theatre', 'casino']: return 'entertainment'
+    if shop in ['supermarket', 'convenience', 'greengrocer']: return 'market'
+    if shop: return 'shop' # Cualquier otra tienda
+    if leisure in ['park', 'garden', 'pitch']: return 'park'
+    if highway: return 'street'
+    
+    # Si tiene número de casa pero no es nada de lo anterior
+    if tags.get('addr:housenumber'): return 'home'
+    
+    return 'other'
+
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Multi-Map Merge) is Running", 200
+    return "Car Launcher API (Icons + Vacuum Ready) is Running", 200
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -44,7 +68,6 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # Query optimizada (solo nombres o direcciones)
         query = f"""
         [out:xml][timeout:180];
         (
@@ -56,7 +79,7 @@ def generate_db():
         out center;
         """
         
-        print(f"Descargando Merge-Ready: {min_lat},{min_lon}")
+        print(f"Descargando Type-Ready: {min_lat},{min_lon}")
         
         headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
         response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
@@ -71,15 +94,16 @@ def generate_db():
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
-        # --- CAMBIO IMPORTANTE: Columna 'osm_id' ---
+        # --- CAMBIO: Agregamos columna 'type' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
-                osm_id,  -- ID Único para evitar duplicados al fusionar
+                osm_id, 
                 name, 
                 address, 
                 lat, 
                 lon, 
-                keywords
+                keywords,
+                type  -- Columna nueva para el icono
             );
         ''')
 
@@ -88,7 +112,6 @@ def generate_db():
         
         for event, elem in context:
             if elem.tag in ('node', 'way'):
-                # Generamos ID único: "n12345" o "w67890"
                 raw_id = elem.get('id')
                 type_prefix = "n" if elem.tag == 'node' else "w"
                 unique_osm_id = f"{type_prefix}{raw_id}"
@@ -98,6 +121,9 @@ def generate_db():
                 raw_name = tags.get('name')
                 street = tags.get('addr:street')
                 number = tags.get('addr:housenumber')
+                
+                # Determinamos el tipo
+                place_type = get_place_type(tags)
                 
                 lat, lon = None, None
                 if elem.tag == 'node':
@@ -116,8 +142,9 @@ def generate_db():
                             if full in address_name:
                                 kw_addr += " " + address_name.replace(full, abbr)
 
-                        # Guardamos con unique_osm_id + sufijo "_addr" para diferenciarlo del negocio
-                        batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr))
+                        # Las direcciones puras son tipo 'home' o 'street'
+                        addr_type = 'home'
+                        batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr, addr_type))
 
                     # 2. Negocio
                     if raw_name:
@@ -133,15 +160,15 @@ def generate_db():
                         kw_poi = poi_name
                         if street: kw_poi += " " + street
                         
-                        batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi))
+                        batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi, place_type))
 
                 elem.clear()
                 if len(batch) >= 2000:
-                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?)", batch)
+                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                     batch = []
 
         if batch:
-            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?)", batch)
+            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
 
         conn.commit()
         conn.close()
