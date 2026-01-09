@@ -49,7 +49,7 @@ def get_place_type(tags):
     
     return 'other'
 
-# --- NUEVO: Función para limpiar velocidad ---
+# Función para limpiar velocidad
 def parse_speed_limit(tags):
     raw_speed = tags.get('maxspeed', '')
     if not raw_speed: return None
@@ -62,7 +62,50 @@ def parse_speed_limit(tags):
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Speed Limits Ready) is Running", 200
+    return "Car Launcher API (Regional Search Ready) is Running", 200
+
+# --- NUEVO: Endpoint para buscar regiones por nombre (Geocoding) ---
+@app.route('/resolve_region', methods=['GET'])
+def resolve_region():
+    try:
+        query = request.args.get('name')
+        if not query:
+            return "Falta el nombre", 400
+
+        # Usamos la API pública de Nominatim (Requiere User-Agent)
+        nominatim_url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            'q': query,
+            'format': 'json',
+            'limit': 1,
+            'polygon_geojson': 0
+        }
+        headers = {'User-Agent': 'CarLauncher/1.0'}
+        
+        response = requests.get(nominatim_url, params=params, headers=headers)
+        
+        if response.status_code != 200:
+            return "Error en Nominatim", 502
+            
+        data = response.json()
+        
+        if not data:
+            return "No se encontró la región", 404
+            
+        # Nominatim devuelve boundingbox como: [minLat, maxLat, minLon, maxLon] (strings)
+        result = data[0]
+        bbox = result.get('boundingbox')
+        
+        return {
+            "name": result.get('display_name'),
+            "minLat": float(bbox[0]),
+            "maxLat": float(bbox[1]),
+            "minLon": float(bbox[2]),
+            "maxLon": float(bbox[3])
+        }
+
+    except Exception as e:
+        return f"Error: {e}", 500
 
 @app.route('/generate_db', methods=['GET'])
 def generate_db():
@@ -79,7 +122,6 @@ def generate_db():
         if not all([min_lat, min_lon, max_lat, max_lon]):
             return "Faltan coordenadas", 400
 
-        # Query actualizada: Pedimos también way["maxspeed"]
         query = f"""
         [out:xml][timeout:180];
         (
@@ -107,7 +149,6 @@ def generate_db():
         cursor.execute('PRAGMA synchronous = OFF') 
         cursor.execute('PRAGMA journal_mode = MEMORY')
         
-        # --- CAMBIO: Agregamos columna 'speed_limit' ---
         cursor.execute('''
             CREATE VIRTUAL TABLE search_index USING fts4(
                 osm_id, 
@@ -137,7 +178,7 @@ def generate_db():
                 number = tags.get('addr:housenumber')
                 
                 place_type = get_place_type(tags)
-                speed = parse_speed_limit(tags) # Obtenemos la velocidad
+                speed = parse_speed_limit(tags)
                 
                 lat, lon = None, None
                 if elem.tag == 'node':
@@ -147,10 +188,8 @@ def generate_db():
                     if center: lat, lon = center.get('lat'), center.get('lon')
 
                 if lat and lon:
-                    # Guardamos si tiene nombre, dirección O velocidad
                     if raw_name or (street and number) or speed:
                         
-                        # Lógica para Direcciones
                         if street and number:
                             address_name = f"{street} {number}"
                             subtitle = labels['highway']
@@ -160,14 +199,11 @@ def generate_db():
                                     kw_addr += " " + address_name.replace(full, abbr)
 
                             addr_type = 'home'
-                            # Nota: Las casas generalmente no tienen límite de velocidad propio, lo heredan de la calle
                             batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr, addr_type, None))
 
-                        # Lógica para Negocios o Calles (con velocidad)
-                        # Si no tiene nombre pero tiene velocidad, le ponemos un nombre genérico
                         poi_name = raw_name
                         if not poi_name and speed:
-                            poi_name = street if street else labels['highway'] # Ej: "Street" o nombre de la calle
+                            poi_name = street if street else labels['highway']
 
                         if poi_name:
                             poi_subtitle = ""
