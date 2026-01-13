@@ -1,14 +1,13 @@
 import os
-import sqlite3
 import requests
-import uuid
 import re
+import json
 import xml.etree.ElementTree as ET
-from flask import Flask, request, send_file, after_this_request
+from flask import Flask, request, Response, stream_with_context
 
 app = Flask(__name__)
 
-# Mirror rápido
+# Mirror rápido de Overpass
 OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 
 ABBREVIATIONS = {
@@ -26,7 +25,6 @@ LANG_LABELS = {
     'default': { 'highway': 'Street', 'amenity': 'Place' }
 }
 
-# Clasificador de Tipos para Iconos
 def get_place_type(tags):
     amenity = tags.get('amenity', '')
     shop = tags.get('shop', '')
@@ -44,55 +42,36 @@ def get_place_type(tags):
     if shop: return 'shop'
     if leisure in ['park', 'garden', 'pitch']: return 'park'
     if highway: return 'street'
-    
     if tags.get('addr:housenumber'): return 'home'
-    
     return 'other'
 
-# Función para limpiar velocidad
 def parse_speed_limit(tags):
     raw_speed = tags.get('maxspeed', '')
     if not raw_speed: return None
-    
-    # Extraemos solo el número (ej: "50 mph" -> "50")
     match = re.match(r"([0-9]+)", raw_speed)
-    if match:
-        return match.group(1)
+    if match: return match.group(1)
     return None
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return "Car Launcher API (Regional Search Ready) is Running", 200
+    return "Car Launcher Streaming API is Running", 200
 
-# --- NUEVO: Endpoint para buscar regiones por nombre (Geocoding) ---
 @app.route('/resolve_region', methods=['GET'])
 def resolve_region():
     try:
         query = request.args.get('name')
-        if not query:
-            return "Falta el nombre", 400
+        if not query: return "Falta el nombre", 400
 
-        # Usamos la API pública de Nominatim (Requiere User-Agent)
         nominatim_url = "https://nominatim.openstreetmap.org/search"
-        params = {
-            'q': query,
-            'format': 'json',
-            'limit': 1,
-            'polygon_geojson': 0
-        }
+        params = {'q': query, 'format': 'json', 'limit': 1, 'polygon_geojson': 0}
         headers = {'User-Agent': 'CarLauncher/1.0'}
         
         response = requests.get(nominatim_url, params=params, headers=headers)
-        
-        if response.status_code != 200:
-            return "Error en Nominatim", 502
+        if response.status_code != 200: return "Error en Nominatim", 502
             
         data = response.json()
-        
-        if not data:
-            return "No se encontró la región", 404
+        if not data: return "No se encontró la región", 404
             
-        # Nominatim devuelve boundingbox como: [minLat, maxLat, minLon, maxLon] (strings)
         result = data[0]
         bbox = result.get('boundingbox')
         
@@ -103,145 +82,133 @@ def resolve_region():
             "minLon": float(bbox[2]),
             "maxLon": float(bbox[3])
         }
-
     except Exception as e:
         return f"Error: {e}", 500
 
 @app.route('/generate_db', methods=['GET'])
-def generate_db():
-    filename = f"map_{uuid.uuid4()}.db"
-    conn = None
-    try:
-        min_lat = request.args.get('minLat')
-        min_lon = request.args.get('minLon')
-        max_lat = request.args.get('maxLat')
-        max_lon = request.args.get('maxLon')
-        lang_code = request.args.get('lang', 'en')
-        labels = LANG_LABELS.get(lang_code, LANG_LABELS['default'])
-        
-        if not all([min_lat, min_lon, max_lat, max_lon]):
-            return "Faltan coordenadas", 400
+def generate_stream():
+    # Validamos parámetros antes de iniciar el stream
+    min_lat = request.args.get('minLat')
+    min_lon = request.args.get('minLon')
+    max_lat = request.args.get('maxLat')
+    max_lon = request.args.get('maxLon')
+    lang_code = request.args.get('lang', 'en')
+    labels = LANG_LABELS.get(lang_code, LANG_LABELS['default'])
+    
+    if not all([min_lat, min_lon, max_lat, max_lon]):
+        return "Faltan coordenadas", 400
 
-        query = f"""
-        [out:xml][timeout:180];
-        (
-          node["name"]({min_lat},{min_lon},{max_lat},{max_lon});
-          way["name"]({min_lat},{min_lon},{max_lat},{max_lon});
-          node["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
-          way["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
-          way["maxspeed"]({min_lat},{min_lon},{max_lat},{max_lon});
-        );
-        out center;
-        """
-        
-        print(f"Descargando Speed-Ready: {min_lat},{min_lon}")
-        
-        headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
-        response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
-        
-        if response.status_code != 200:
-            return f"OSM Error {response.status_code}", 502
+    # Query optimizada para Overpass
+    query = f"""
+    [out:xml][timeout:180];
+    (
+      node["name"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["name"]({min_lat},{min_lon},{max_lat},{max_lon});
+      node["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["addr:housenumber"]({min_lat},{min_lon},{max_lat},{max_lon});
+      way["maxspeed"]({min_lat},{min_lon},{max_lat},{max_lon});
+    );
+    out center;
+    """
 
-        response.raw.decode_content = True
+    def generate():
+        try:
+            # Conectamos con Overpass en modo stream
+            headers = {'User-Agent': 'CarLauncher/1.0', 'Accept-Encoding': 'gzip'}
+            response = requests.get(OVERPASS_URL, params={'data': query}, headers=headers, stream=True)
+            
+            if response.status_code != 200:
+                yield json.dumps({"error": f"OSM Error {response.status_code}"}) + "\n"
+                return
 
-        conn = sqlite3.connect(filename)
-        cursor = conn.cursor()
-        cursor.execute('PRAGMA synchronous = OFF') 
-        cursor.execute('PRAGMA journal_mode = MEMORY')
-        
-        cursor.execute('''
-            CREATE VIRTUAL TABLE search_index USING fts4(
-                osm_id, 
-                name, 
-                address, 
-                lat, 
-                lon, 
-                keywords,
-                type,
-                speed_limit
-            );
-        ''')
+            response.raw.decode_content = True
+            context = ET.iterparse(response.raw, events=('end',))
+            
+            # Procesamos y enviamos dato por dato
+            for event, elem in context:
+                if elem.tag in ('node', 'way'):
+                    raw_id = elem.get('id')
+                    type_prefix = "n" if elem.tag == 'node' else "w"
+                    unique_osm_id = f"{type_prefix}{raw_id}"
 
-        context = ET.iterparse(response.raw, events=('end',))
-        batch = []
-        
-        for event, elem in context:
-            if elem.tag in ('node', 'way'):
-                raw_id = elem.get('id')
-                type_prefix = "n" if elem.tag == 'node' else "w"
-                unique_osm_id = f"{type_prefix}{raw_id}"
+                    tags = {tag.get('k'): tag.get('v') for tag in elem.findall('tag')}
+                    
+                    raw_name = tags.get('name')
+                    street = tags.get('addr:street')
+                    number = tags.get('addr:housenumber')
+                    
+                    place_type = get_place_type(tags)
+                    speed = parse_speed_limit(tags)
+                    
+                    lat, lon = None, None
+                    if elem.tag == 'node':
+                        lat, lon = elem.get('lat'), elem.get('lon')
+                    elif elem.tag == 'way':
+                        center = elem.find('center')
+                        if center: lat, lon = center.get('lat'), center.get('lon')
 
-                tags = {tag.get('k'): tag.get('v') for tag in elem.findall('tag')}
-                
-                raw_name = tags.get('name')
-                street = tags.get('addr:street')
-                number = tags.get('addr:housenumber')
-                
-                place_type = get_place_type(tags)
-                speed = parse_speed_limit(tags)
-                
-                lat, lon = None, None
-                if elem.tag == 'node':
-                    lat, lon = elem.get('lat'), elem.get('lon')
-                elif elem.tag == 'way':
-                    center = elem.find('center')
-                    if center: lat, lon = center.get('lat'), center.get('lon')
-
-                if lat and lon:
-                    if raw_name or (street and number) or speed:
-                        
-                        if street and number:
-                            address_name = f"{street} {number}"
-                            subtitle = labels['highway']
-                            kw_addr = address_name
-                            for full, abbr in ABBREVIATIONS.items():
-                                if full in address_name:
-                                    kw_addr += " " + address_name.replace(full, abbr)
-
-                            addr_type = 'home'
-                            batch.append((f"{unique_osm_id}_addr", address_name, subtitle, lat, lon, kw_addr, addr_type, None))
-
-                        poi_name = raw_name
-                        if not poi_name and speed:
-                            poi_name = street if street else labels['highway']
-
-                        if poi_name:
-                            poi_subtitle = ""
-                            if street and number:
-                                poi_subtitle = f"{street} {number}"
-                            elif 'amenity' in tags:
-                                poi_subtitle = labels['amenity']
-                            else:
-                                poi_subtitle = labels['highway']
-
-                            kw_poi = poi_name
-                            if street: kw_poi += " " + street
+                    if lat and lon:
+                        if raw_name or (street and number) or speed:
                             
-                            batch.append((unique_osm_id, poi_name, poi_subtitle, lat, lon, kw_poi, place_type, speed))
+                            # Caso 1: Dirección exacta
+                            if street and number:
+                                address_name = f"{street} {number}"
+                                subtitle = labels['highway']
+                                kw_addr = address_name
+                                for full, abbr in ABBREVIATIONS.items():
+                                    if full in address_name:
+                                        kw_addr += " " + address_name.replace(full, abbr)
 
-                elem.clear()
-                if len(batch) >= 2000:
-                    cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
-                    batch = []
+                                item_addr = {
+                                    "osm_id": f"{unique_osm_id}_addr",
+                                    "name": address_name,
+                                    "address": subtitle,
+                                    "lat": lat, "lon": lon,
+                                    "keywords": kw_addr,
+                                    "type": "home",
+                                    "speed_limit": None
+                                }
+                                # Enviamos JSON en una línea
+                                yield json.dumps(item_addr) + "\n"
 
-        if batch:
-            cursor.executemany("INSERT INTO search_index VALUES (?, ?, ?, ?, ?, ?, ?, ?)", batch)
+                            # Caso 2: POI o Velocidad
+                            poi_name = raw_name
+                            if not poi_name and speed:
+                                poi_name = street if street else labels['highway']
 
-        conn.commit()
-        conn.close()
+                            if poi_name:
+                                poi_subtitle = ""
+                                if street and number:
+                                    poi_subtitle = f"{street} {number}"
+                                elif 'amenity' in tags:
+                                    poi_subtitle = labels['amenity']
+                                else:
+                                    poi_subtitle = labels['highway']
 
-        @after_this_request
-        def remove_file(response):
-            try:
-                if os.path.exists(filename): os.remove(filename)
-            except: pass
-            return response
+                                kw_poi = poi_name
+                                if street: kw_poi += " " + street
+                                
+                                item_poi = {
+                                    "osm_id": unique_osm_id,
+                                    "name": poi_name,
+                                    "address": poi_subtitle,
+                                    "lat": lat, "lon": lon,
+                                    "keywords": kw_poi,
+                                    "type": place_type,
+                                    "speed_limit": speed
+                                }
+                                # Enviamos JSON en una línea
+                                yield json.dumps(item_poi) + "\n"
 
-        return send_file(filename, as_attachment=True, download_name="offline_data.db")
+                    elem.clear()
+            
+        except Exception as e:
+            # En un stream es difícil reportar error HTTP si ya empezamos a enviar 200 OK,
+            # pero podemos enviar un JSON de error.
+            yield json.dumps({"error": str(e)}) + "\n"
 
-    except Exception as e:
-        if conn: conn.close()
-        return f"Error: {e}", 500
+    # Retornamos respuesta NDJSON (Newline Delimited JSON)
+    return Response(stream_with_context(generate()), mimetype='application/x-ndjson')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
